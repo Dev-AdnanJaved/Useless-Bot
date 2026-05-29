@@ -41,11 +41,13 @@ class TelegramCommandListener:
         chat_id: str,
         tracker: SignalTracker,
         binance: BinanceClient,
+        paper_trader=None,   # PaperTrader — optional
     ) -> None:
         self._token = bot_token
         self._chat_id = str(chat_id)
         self._tracker = tracker
         self._binance = binance
+        self._paper_trader = paper_trader
         self._session = requests.Session()
         self._offset: int = 0
         self._running = False
@@ -272,6 +274,8 @@ class TelegramCommandListener:
             "/detailed_report": lambda: self._cmd_detailed_report(chat_id),
             "/export_csv":      lambda: self._cmd_export_csv(chat_id),
             "/validate":        lambda: self._cmd_validate(chat_id),
+            "/strategy":        lambda: self._cmd_strategy(chat_id),
+            "/balance":         lambda: self._cmd_strategy(chat_id),
             "/help":            lambda: self._cmd_help(chat_id),
             "/start":           lambda: self._cmd_help(chat_id),
         }
@@ -923,6 +927,16 @@ class TelegramCommandListener:
 
     # ── /help ────────────────────────────────────────────────────────
 
+    def _cmd_strategy(self, chat_id: str) -> None:
+        """Show paper/live trading strategy status and balance."""
+        if self._paper_trader is None:
+            self._send(chat_id, "⚠️ Strategy is not enabled. Set <code>strategy.enabled: true</code> in config.json")
+            return
+        try:
+            self._send(chat_id, self._paper_trader.get_stats_summary())
+        except Exception as exc:
+            self._send(chat_id, f"❌ Error fetching strategy status: {exc}")
+
     def _cmd_help(self, chat_id: str) -> None:
         text = (
             "🤖 <b>COMMANDS</b>\n\n"
@@ -937,6 +951,8 @@ class TelegramCommandListener:
             "                   peak, lowest, exit prices\n"
             "/export_csv — Flat CSV of all signals for analysis\n"
             "/validate — Data integrity check on active signals\n"
+            "/strategy — Paper/live trading balance and open positions\n"
+            "/balance — Same as /strategy\n"
             "/help — This message\n\n"
             f"📡 Tracking window: {self._tracker.max_age_hours}h\n"
             "🏔 Prices update every 5 min\n"

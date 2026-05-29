@@ -4,8 +4,8 @@
     "api_secret": ""
   },
   "telegram": {
-    "bot_token": "YOUR_BOT_TOKEN",
-    "chat_id": "YOUR_CHAT_ID"
+    "bot_token": "",
+    "chat_id": ""
   },
   "scanner": {
     "timeframe": "1h",
@@ -16,7 +16,7 @@
     "high_breakout_warning_pct": 5.0,
     "max_price_change_24h_pct": 20.0,
     "min_volume_usdt": 0,
-    "cooldown_hours": 168,
+    "cooldown_hours": 72,
     "excluded_symbols": ["USDCUSDT", "BTCDOMUSDT"],
     "hard_filters": {
       "vol_ratio_max": 15,
@@ -63,7 +63,7 @@
     "price_update_interval_seconds": 300,
     "data_dir": "data",
     "take_profit_targets": [5, 10, 20, 30, 50, 75, 100],
-    "reversal_alert_enabled": true,
+    "reversal_alert_enabled": false,
     "min_reversal_peak_pct": 3.0,
     "reversal_drop_from_peak_pct": 5.0,
     "detailed_report_min_age_hours": 168,
@@ -74,10 +74,44 @@
     "cache_minutes": 120
   },
   "rate_limit": {
-    "binance_delay_ms": 100
+    "binance_delay_ms": 200
   },
   "logging": {
     "level": "INFO",
     "log_file": "scanner.log"
+  },
+  "strategy": {
+    "enabled": true,
+    "paper_mode": true,
+    "starting_balance": 50.0,
+    "leverage": 5,
+    "margin_pct_per_trade": 0.03,
+    "max_open_trades": 40,
+    "initial_sl_pct": -20,
+    "tp_cap": 100,
+    "fee_rate": 0.0004,
+    "slippage_rate": 0.001,
+    "btc_macro_3d_min_pct": 0.0,
+    "btc_macro_7d_min_pct": 0.0,
+    "skip_score_max": 1,
+    "continuation_vol_min": 2.5,
+    "continuation_mcap_max": 100000000,
+    "fast_hours": {
+      "5": 12,
+      "10": 24,
+      "20": 24,
+      "30": 36,
+      "50": 48,
+      "75": 60,
+      "100": 72
+    },
+    "sl_ladder": {
+      "5": 0,
+      "10": 5,
+      "20": 10,
+      "30": 20,
+      "50": 30,
+      "75": 50
+    }
   }
 }

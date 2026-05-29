@@ -109,6 +109,184 @@ class TelegramNotifier:
     def send_reversal_warning(self, data: dict) -> bool:
         return self.send(self._fmt_reversal(data))
 
+    # ── strategy alert types ──────────────────────────────────────────
+
+    def send_strategy_entry(
+        self, alert: dict, pos, btc_3d, btc_7d,
+        balance: float, open_count: int, max_open: int,
+    ) -> bool:
+        """Alert when strategy opens a paper/live position."""
+        sym = alert["symbol"]
+        reason = alert.get("strategy_filter_reason", "")
+        skip_score = alert.get("strategy_skip_score", 0)
+        mode = "📋 PAPER" if True else "🔴 LIVE"  # always shows mode in message
+
+        notional = pos.margin_usdt * pos.leverage
+        sl_price = pos.entry_price * (1 + pos.current_sl_pct / 100)
+
+        text = (
+            f"🟢 <b>STRATEGY ENTRY — {sym}</b>\n"
+            f"{'━' * 28}\n\n"
+            f"💵 Entry:      {self._fp(pos.entry_price)}\n"
+            f"🛑 SL:         {self._fp(sl_price)}  ({pos.current_sl_pct:.0f}%)\n"
+            f"📦 Margin:     ${pos.margin_usdt:.2f} × {pos.leverage}x = ${notional:.2f} notional\n\n"
+            f"<b>Entry filter: ✅ PASSED</b>\n"
+            f"{reason}\n\n"
+            f"📊 Position {open_count}/{max_open}\n"
+            f"💰 Balance:    ${balance:.2f}"
+        )
+        return self.send(text)
+
+    def send_strategy_blocked(self, alert: dict, filter_reason: str) -> bool:
+        """Alert for signals seen but NOT traded because filter failed."""
+        sym = alert["symbol"]
+        text = (
+            f"⚪ <b>SIGNAL BLOCKED — {sym}</b>\n"
+            f"{'━' * 28}\n\n"
+            f"Strategy filter: ❌ DID NOT PASS\n\n"
+            f"{filter_reason}\n\n"
+            f"<i>Signal is tracked normally. Not traded.</i>"
+        )
+        return self.send(text)
+
+    def send_strategy_tp_hold(
+        self, pos, tp_level: int, score: int, score_parts: list,
+        new_sl, balance: float,
+    ) -> bool:
+        """Alert when TP hits and strategy says HOLD + move SL."""
+        from strategy import tp_icon, sl_level_name
+        sl_label = sl_level_name(new_sl) if new_sl is not None else "unchanged"
+        sl_price = pos.entry_price * (1 + (new_sl or 0) / 100)
+
+        score_text = "\n".join(f"  {p}" for p in score_parts)
+        pnl_if_sl = pos.margin_pnl_usdt(new_sl or 0) if new_sl is not None else 0
+
+        text = (
+            f"{tp_icon(tp_level)} <b>TP{tp_level}% HIT — HOLDING — {pos.symbol}</b>\n"
+            f"{'━' * 28}\n\n"
+            f"<b>Continuation score: {score}/3</b>\n"
+            f"{score_text}\n\n"
+            f"🔒 <b>ACTION: HOLD</b>\n"
+            f"   SL moved to: {sl_label}\n"
+            f"   SL price:    {self._fp(sl_price)}\n"
+            f"   Min locked:  +${pnl_if_sl:.2f} (if SL hits)\n\n"
+            f"💰 Balance: ${balance:.2f}"
+        )
+        return self.send(text)
+
+    def send_strategy_tp_exit(
+        self, pos, tp_level: int, score: int, score_parts: list,
+        pnl: float, balance: float,
+    ) -> bool:
+        """Alert when TP hits and strategy says EXIT."""
+        from strategy import tp_icon
+        score_text = "\n".join(f"  {p}" for p in score_parts)
+        margin_ret = (pnl / pos.margin_usdt * 100) if pos.margin_usdt > 0 else 0
+        tp_path = " → ".join(
+            [f"TP{e['tp_level']}" + ("✅" if e['action'] == 'EXIT' else "🔒")
+             for e in pos.tp_history]
+        )
+
+        text = (
+            f"{tp_icon(tp_level)} <b>CLOSED at TP{tp_level}% — {pos.symbol}</b>\n"
+            f"{'━' * 28}\n\n"
+            f"<b>Score: {score}/3 → EXIT</b>\n"
+            f"{score_text}\n\n"
+            f"✅ <b>POSITION CLOSED</b>\n"
+            f"   Price exit:  +{tp_level}%\n"
+            f"   Margin:      ${pos.margin_usdt:.2f}\n"
+            f"   Return:      {margin_ret:+.1f}% on margin\n"
+            f"   P&L:         {'+' if pnl >= 0 else ''}${pnl:.2f}\n\n"
+            f"📊 Trade path: {tp_path}\n\n"
+            f"💰 Balance: ${balance:.2f}"
+        )
+        return self.send(text)
+
+    def send_strategy_sl_hit(self, pos, sl_pct: float, pnl: float, balance: float) -> bool:
+        """Alert when a trailed SL is hit and position closes."""
+        from strategy import sl_level_name
+        sl_label = sl_level_name(sl_pct)
+        margin_ret = (pnl / pos.margin_usdt * 100) if pos.margin_usdt > 0 else 0
+        best_tp = pos.highest_tp_hit
+
+        if sl_pct <= -19.9:
+            icon = "💥"
+            title = f"STOPPED OUT (initial SL)"
+        elif sl_pct >= 0:
+            icon = "🛡️"
+            title = f"SL HIT — profit secured"
+        else:
+            icon = "🛑"
+            title = f"SL HIT at {sl_label}"
+
+        text = (
+            f"{icon} <b>{title} — {pos.symbol}</b>\n"
+            f"{'━' * 28}\n\n"
+            f"SL level:     {sl_label}\n"
+            f"Margin:       ${pos.margin_usdt:.2f}\n"
+            f"Return:       {margin_ret:+.1f}% on margin\n"
+            f"P&L:          {'+' if pnl >= 0 else ''}${pnl:.2f}\n"
+            f"Best TP hit:  +{best_tp}%\n\n"
+            f"💰 Balance: ${balance:.2f}"
+        )
+        return self.send(text)
+
+    def send_strategy_timeout_close(
+        self, pos, pnl: float, price_pct: float, balance: float,
+    ) -> bool:
+        """Alert when a position is closed because 7-day window expired."""
+        margin_ret = (pnl / pos.margin_usdt * 100) if pos.margin_usdt > 0 else 0
+
+        text = (
+            f"⏰ <b>7-DAY TIMEOUT — {pos.symbol}</b>\n"
+            f"{'━' * 28}\n\n"
+            f"Closed at:    {price_pct:+.2f}% from entry\n"
+            f"Margin:       ${pos.margin_usdt:.2f}\n"
+            f"Return:       {margin_ret:+.1f}% on margin\n"
+            f"P&L:          {'+' if pnl >= 0 else ''}${pnl:.2f}\n"
+            f"Best TP hit:  +{pos.highest_tp_hit}%\n\n"
+            f"💰 Balance: ${balance:.2f}"
+        )
+        return self.send(text)
+
+    def send_no_signals_status(
+        self, reason: str, btc_3d, btc_7d, btc_detail: dict = None,
+        positions_status: str = "",
+    ) -> bool:
+        """Alert when no signals are being taken due to macro filter."""
+        btc_3d_str = f"{btc_3d:+.2f}%" if btc_3d is not None else "unavailable"
+        btc_7d_str = f"{btc_7d:+.2f}%" if btc_7d is not None else "unavailable"
+        btc_4h = btc_detail.get("btc_chg_4h", 0) if btc_detail else 0
+        btc_24h = btc_detail.get("btc_chg_24h", 0) if btc_detail else 0
+
+        text = (
+            f"📵 <b>NO NEW ENTRIES — FILTER BLOCKING</b>\n"
+            f"{'━' * 28}\n\n"
+            f"<b>Reason:</b> {reason}\n\n"
+            f"BTC 4h:   {btc_4h:+.2f}%\n"
+            f"BTC 24h:  {btc_24h:+.2f}%\n"
+            f"BTC 3d:   {btc_3d_str}\n"
+            f"BTC 7d:   {btc_7d_str}\n\n"
+            f"<i>New entries blocked. Open positions running normally.</i>\n"
+            f"<i>Entries resume when BTC 3d AND 7d both &gt; 0%</i>"
+        )
+        if positions_status:
+            text += f"\n\n{positions_status}"
+
+        return self.send(text)
+
+    def send_strategy_skipped_max_open(
+        self, symbol: str, open_count: int, balance: float,
+    ) -> bool:
+        """Alert when a signal is skipped because max_open is reached."""
+        text = (
+            f"⚠️ <b>SKIPPED (MAX OPEN) — {symbol}</b>\n"
+            f"Open positions: {open_count} (at limit)\n"
+            f"Signal passed filter but no slot available.\n"
+            f"💰 Balance: ${balance:.2f}"
+        )
+        return self.send(text)
+
     # ── price formatting ─────────────────────────────────────────────
 
     @staticmethod
@@ -207,6 +385,36 @@ class TelegramNotifier:
             f"🕐 <b>Time:</b>  {alert_time}",
             f"⏱ <b>Cooldown:</b>  {cooldown}h",
         ])
+
+        # ── STRATEGY DECISION — always shown at bottom of signal ──────
+        should_trade = d.get("strategy_should_trade")
+        if should_trade is True:
+            b3   = d.get("strategy_btc_3d")
+            b7   = d.get("strategy_btc_7d")
+            skip = d.get("strategy_skip_score", 0)
+            b3s  = f"{b3:+.2f}%" if b3 is not None else "N/A"
+            b7s  = f"{b7:+.2f}%" if b7 is not None else "N/A"
+            lines += [
+                "",
+                "━" * 28,
+                "🟢 <b>STRATEGY: TRADE OPENED</b>",
+                f"   BTC 3d: {b3s} ✅   BTC 7d: {b7s} ✅",
+                f"   Skip score: {skip}/6 ✅",
+                f"   📋 Paper position opened",
+            ]
+        elif should_trade is False:
+            reason = d.get("strategy_filter_reason", "")
+            lines += [
+                "",
+                "━" * 28,
+                "⛔ <b>STRATEGY: NOT TRADED</b>",
+            ]
+            for line in reason.split("\n"):
+                if line.strip():
+                    lines.append(f"   {line.strip()}")
+        elif should_trade is None:
+            pass  # strategy disabled — show nothing
+
         return "\n".join(lines)
 
     # ── take-profit alert format ─────────────────────────────────────

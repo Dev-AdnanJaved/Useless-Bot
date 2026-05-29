@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Set
 from binance_client import BinanceClient
 from market_cap import MarketCapProvider
 from notifier import TelegramNotifier
+from strategy import compute_continuation_score, decide_tp_action
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class SignalTracker:
         binance: BinanceClient,
         notifier: TelegramNotifier,
         market_cap: Optional[MarketCapProvider] = None,
+        paper_trader=None,   # PaperTrader — optional strategy execution layer
     ) -> None:
         tc = config.get("tracker", {})
         self._max_age = tc.get("max_age_hours", 168) * 3600
@@ -65,6 +67,7 @@ class SignalTracker:
         self._binance = binance
         self._notifier = notifier
         self._market_cap = market_cap
+        self._paper_trader = paper_trader
         self._lock = threading.Lock()
         self._running = False
 
@@ -624,6 +627,9 @@ class SignalTracker:
         try:
             prices = self._binance.get_mark_prices()
             self.apply_prices(prices)
+            # Check if any trailed stop-losses have been hit
+            if self._paper_trader is not None:
+                self._paper_trader.check_sl_hits(prices)
         except Exception as exc:
             logger.warning("Tracker price update failed: %s", exc)
 
@@ -710,16 +716,47 @@ class SignalTracker:
 
                     self._add_journey_event(sig, f"tp_hit_{target}", now, btc_at_check)
 
+                    # ── STRATEGY DECISION (continuation score + action) ────
+                    strategy_action = None
+                    strategy_score = None
+                    strategy_score_parts = []
+                    strategy_new_sl = None
+
+                    if self._paper_trader is not None and sig.get("strategy_should_trade"):
+                        snap = sig.get(f"tp{target}_snapshot", {})
+                        strategy_score, strategy_score_parts = compute_continuation_score(snap, target)
+                        action, new_sl = decide_tp_action(strategy_score, target)
+                        strategy_action = action
+                        strategy_new_sl = new_sl
+
+                        # Tell paper_trader about this TP hit
+                        self._paper_trader.on_tp_hit(
+                            symbol=sig["symbol"],
+                            tp_level=target,
+                            score=strategy_score,
+                            score_parts=strategy_score_parts,
+                            action=action,
+                            new_sl=new_sl,
+                            snapshot=snap,
+                            current_price=current,
+                        )
+
                     alerts_to_send.append({
-                        "type":          "take_profit",
-                        "symbol":        sig["symbol"],
-                        "target":        target,
-                        "entry_price":   entry,
-                        "current_price": current,
-                        "highest_price": highest,
-                        "cur_pct":       cur_pct,
-                        "high_pct":      high_pct,
-                        "age_str":       age_str,
+                        "type":            "take_profit",
+                        "symbol":          sig["symbol"],
+                        "target":          target,
+                        "entry_price":     entry,
+                        "current_price":   current,
+                        "highest_price":   highest,
+                        "cur_pct":         cur_pct,
+                        "high_pct":        high_pct,
+                        "age_str":         age_str,
+                        # Strategy fields (None if strategy disabled / signal not traded)
+                        "strategy_should_trade":  sig.get("strategy_should_trade"),
+                        "strategy_score":         strategy_score,
+                        "strategy_score_parts":   strategy_score_parts,
+                        "strategy_action":        strategy_action,
+                        "strategy_new_sl":        strategy_new_sl,
                     })
                     logger.info(
                         "🎯 TP target +%d%% hit for %s (peak: +%.2f%%, now: %+.2f%%)",
@@ -901,6 +938,14 @@ class SignalTracker:
 
                     newly_archived.append(sig)
                     archived += 1
+
+                    # Notify paper_trader that this position expired (7-day close)
+                    if self._paper_trader is not None and sig.get("strategy_should_trade"):
+                        exit_price = sig.get("current_price", 0)
+                        try:
+                            self._paper_trader.force_close_expired(sig["symbol"], exit_price)
+                        except Exception as exc:
+                            logger.warning("paper_trader force_close_expired failed for %s: %s", sig["symbol"], exc)
                 else:
                     active.append(sig)
 

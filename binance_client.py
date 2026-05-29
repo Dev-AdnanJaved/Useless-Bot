@@ -224,3 +224,49 @@ class BinanceClient:
         except Exception as exc:
             logger.debug("Funding rate unavailable for %s: %s", symbol, exc)
             return None
+
+    def get_btc_daily_change(self, days: int = 7) -> dict:
+        """
+        Fetch BTC daily OHLC candles and compute % price change over the
+        last N days.
+
+        Returns:
+            {
+                "btc_pct_3d": float or None,
+                "btc_pct_7d": float or None,
+                "btc_current_price": float or None,
+            }
+        """
+        result = {"btc_pct_3d": None, "btc_pct_7d": None, "btc_current_price": None}
+        try:
+            # Fetch up to 10 daily closed candles (need at least 8 for 7d)
+            candles = self.get_closed_klines("BTCUSDT", "1d", 10)
+            if not candles:
+                return result
+
+            current_close = candles[-1]["close"]
+            result["btc_current_price"] = current_close
+
+            if len(candles) >= 4:
+                # 3d ago = candles[-4] (3 closed daily candles back)
+                close_3d_ago = candles[-4]["close"]
+                if close_3d_ago > 0:
+                    result["btc_pct_3d"] = round(
+                        ((current_close - close_3d_ago) / close_3d_ago) * 100, 2
+                    )
+
+            if len(candles) >= 8:
+                # 7d ago = candles[-8]
+                close_7d_ago = candles[-8]["close"]
+                if close_7d_ago > 0:
+                    result["btc_pct_7d"] = round(
+                        ((current_close - close_7d_ago) / close_7d_ago) * 100, 2
+                    )
+
+            logger.debug(
+                "BTC macro: 3d=%s%%, 7d=%s%%  (price=$%.0f)",
+                result["btc_pct_3d"], result["btc_pct_7d"], current_close,
+            )
+        except Exception as exc:
+            logger.warning("get_btc_daily_change failed: %s", exc)
+        return result

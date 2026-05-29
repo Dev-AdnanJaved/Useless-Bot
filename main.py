@@ -23,6 +23,7 @@ from notifier import TelegramNotifier
 from scanner import Scanner
 from tracker import SignalTracker
 from bot_commands import TelegramCommandListener
+from paper_trader import PaperTrader
 
 
 def load_config(path: str = "config.json") -> dict:
@@ -100,7 +101,8 @@ def main() -> None:
     logger.info("  Binance Futures Volume Scanner  —  starting")
     logger.info("=" * 60)
 
-    _start_health_server(port=8080)
+   
+    _start_health_server(port=8100)
 
     # shared binance client
     rl = config.get("rate_limit", {})
@@ -130,6 +132,13 @@ def main() -> None:
     else:
         logger.info("MarketCapProvider disabled")
 
+    # paper / live trader (optional, strategy layer)
+    paper_trader = None
+    if config.get("strategy", {}).get("enabled", False):
+        paper_trader = PaperTrader(config=config, notifier=notifier, binance=binance)
+        mode = "PAPER" if config["strategy"].get("paper_mode", True) else "LIVE"
+        logger.info("PaperTrader enabled [%s mode]", mode)
+
     # tracker (optional)
     tracker_cfg = config.get("tracker", {})
     tracker = None
@@ -138,7 +147,7 @@ def main() -> None:
     cmd_thread = None
 
     if tracker_cfg.get("enabled", False):
-        tracker = SignalTracker(config, binance, notifier, market_cap)
+        tracker = SignalTracker(config, binance, notifier, market_cap, paper_trader)
 
         tracker_thread = threading.Thread(
             target=tracker.run, name="tracker", daemon=True,
@@ -150,6 +159,7 @@ def main() -> None:
             chat_id=config["telegram"]["chat_id"],
             tracker=tracker,
             binance=binance,
+            paper_trader=paper_trader,
         )
         cmd_thread = threading.Thread(
             target=cmd_listener.run, name="commands", daemon=True,
@@ -160,7 +170,7 @@ def main() -> None:
         logger.info("Tracker disabled")
 
     # scanner (main thread)
-    scanner = Scanner(config, binance, notifier, tracker, market_cap)
+    scanner = Scanner(config, binance, notifier, tracker, market_cap, paper_trader)
 
     def _shutdown(sig, _frame):
         logger.info("Received signal %s — shutting down …", sig)

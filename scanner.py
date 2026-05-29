@@ -55,6 +55,7 @@ from typing import Dict, List, Optional
 from binance_client import BinanceClient
 from market_cap import MarketCapProvider
 from notifier import TelegramNotifier
+from strategy import compute_skip_score, passes_entry_filter
 from tracker import SignalTracker
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,7 @@ class Scanner:
         notifier: TelegramNotifier,
         tracker: Optional[SignalTracker] = None,
         market_cap: Optional[MarketCapProvider] = None,
+        paper_trader=None,   # PaperTrader instance
     ) -> None:
         sc = config["scanner"]
 
@@ -161,12 +163,24 @@ class Scanner:
         self._tg = notifier
         self._tracker = tracker
         self._market_cap = market_cap
+        self._paper_trader = paper_trader
         self._cooldown = _CooldownTracker(cooldown_seconds=self.cooldown_hours * 3600)
         self._mark_prices: Dict[str, float] = {}
         self._tickers: Dict[str, dict] = {}
         self._btc_trend: str = "unknown"
         self._btc_trend_detail: Dict[str, float] = {}
         self._running = False
+
+        # Strategy config (entry filter)
+        strat = config.get("strategy", {})
+        self._strategy_enabled: bool  = strat.get("enabled", False)
+        self._btc_macro_3d_min: float = strat.get("btc_macro_3d_min_pct", 0.0)
+        self._btc_macro_7d_min: float = strat.get("btc_macro_7d_min_pct", 0.0)
+        self._skip_score_max:   int   = strat.get("skip_score_max", 1)
+        # BTC macro state — refreshed once per scan cycle (uses daily candles)
+        self._btc_3d: Optional[float] = None
+        self._btc_7d: Optional[float] = None
+        self._btc_macro_ts: float = 0.0
 
     @staticmethod
     def _fmt_vol_usd(vol: float) -> str:
@@ -226,6 +240,28 @@ class Scanner:
         end = time.time() + seconds
         while self._running and time.time() < end:
             time.sleep(min(1.0, end - time.time()))
+
+    def _refresh_btc_macro(self) -> None:
+        """
+        Fetch BTC 3-day and 7-day price change for the strategy entry filter.
+        Uses daily candles — cached for 6 hours (changes slowly).
+        """
+        if not self._strategy_enabled:
+            return
+        # Only refresh every 6 hours (21600 seconds)
+        if time.time() - self._btc_macro_ts < 21600 and self._btc_macro_ts > 0:
+            return
+        try:
+            macro = self._binance.get_btc_daily_change()
+            self._btc_3d = macro.get("btc_pct_3d")
+            self._btc_7d = macro.get("btc_pct_7d")
+            self._btc_macro_ts = time.time()
+            logger.info(
+                "BTC macro refresh: 3d=%s%%, 7d=%s%%",
+                self._btc_3d, self._btc_7d,
+            )
+        except Exception as exc:
+            logger.warning("BTC macro refresh failed: %s", exc)
 
     def _detect_btc_trend(self) -> None:
         if not self.btc_trend_enabled:
@@ -295,6 +331,7 @@ class Scanner:
             self._tickers = {}
 
         self._detect_btc_trend()
+        self._refresh_btc_macro()
 
         if self.btc_trend_enabled and self.btc_skip_on_dump and self._btc_trend == "dumping":
             btc_d = self._btc_trend_detail
@@ -302,6 +339,18 @@ class Scanner:
                 "Skipping scan cycle — BTC is DUMPING (4h: %+.2f%%, 24h: %+.2f%%)",
                 btc_d.get("btc_chg_4h", 0), btc_d.get("btc_chg_24h", 0),
             )
+            # Send "no signals" status with open-position breakdown
+            if self._strategy_enabled and self._paper_trader is not None:
+                positions_status = self._paper_trader.get_positions_during_dump(
+                    self._mark_prices
+                )
+                self._tg.send_no_signals_status(
+                    reason="BTC dumping (4h+24h trend filter)",
+                    btc_3d=self._btc_3d,
+                    btc_7d=self._btc_7d,
+                    btc_detail=btc_d,
+                    positions_status=positions_status,
+                )
             return
 
         already_tracked: set = set()
@@ -334,6 +383,16 @@ class Scanner:
                 if data:
                     if self._tg.send_alert(data):
                         alerts += 1
+
+                    # ── Strategy: open position if filter passed ──
+                    if self._strategy_enabled and self._paper_trader is not None:
+                        if data.get("strategy_should_trade"):
+                            self._paper_trader.open_position(
+                                alert=data,
+                                btc_3d=self._btc_3d,
+                                btc_7d=self._btc_7d,
+                            )
+                        # If blocked: reason is already shown inside the signal alert above
                     time.sleep(0.3)
             except Exception:
                 logger.error("Error analysing %s", sym["symbol"], exc_info=True)
@@ -499,6 +558,29 @@ class Scanner:
 
         if self._tracker:
             self._tracker.record_signal(alert)
+
+        # ── STRATEGY ENTRY FILTER ─────────────────────────────────────
+        if self._strategy_enabled:
+            should_trade, filter_reason = passes_entry_filter(
+                alert,
+                btc_3d=self._btc_3d,
+                btc_7d=self._btc_7d,
+                skip_score_max=self._skip_score_max,
+            )
+            alert["strategy_should_trade"] = should_trade
+            alert["strategy_filter_reason"] = filter_reason
+            alert["strategy_btc_3d"] = self._btc_3d
+            alert["strategy_btc_7d"] = self._btc_7d
+
+            skip_score, _ = compute_skip_score(alert)
+            alert["strategy_skip_score"] = skip_score
+
+            if should_trade:
+                logger.info("✅ STRATEGY: %s passes entry filter — TAKE TRADE", symbol)
+            else:
+                logger.info("⛔ STRATEGY: %s blocked by entry filter", symbol)
+        else:
+            alert["strategy_should_trade"] = None  # strategy disabled
 
         logger.info(
             "🚨 SIGNAL  %s  brk:+%.2f%%  vols:%s→%s→%s  24h:%.1f%%  flags:%d  score:%d/8",
